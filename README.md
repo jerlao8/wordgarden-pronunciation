@@ -8,8 +8,10 @@ pack devices fetch on launch.
 
 Claude does **not** receive audio. The prompt is spelling + failed
 `spokenForm` (+ locale/engine). Claude already knows US pronunciations and
-proposes a short text respell. No WAV upload; no per-word phonology rules
-in the system prompt.
+proposes a short text respell optimized for grapheme-to-phoneme-naive TTS
+(plain lowercase; avoid dictionary CAPS / AH-UH codes). No WAV upload; no
+per-word phonology rules in the system prompt. Reports log `claudeRaw` +
+`spokenForm` under `/var/data/reports/` and stdout (`WG-PRON report …`).
 
 ## Flow
 

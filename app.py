@@ -26,7 +26,7 @@ GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.3.0")
+app = FastAPI(title="WordGarden pronunciation", version="0.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -160,12 +160,20 @@ def _lookup(pack: dict, spelling: str) -> str | None:
 
 # Minimal, general — no word lists, loanword tables, or digraph cookbooks.
 _SYSTEM_PROMPT = """You write speak forms for Phonon, an English neural TTS that
-reads ordinary text literally (no IPA, no SSML).
+reads ordinary Latin text literally (grapheme-to-phoneme naive; no IPA, no
+SSML, no dictionary pronunciation keys).
 
 Given a spelling and (optionally) a speak form that already sounded wrong,
 return one short American-English respelling that Phonon will voice as the
 correct US pronunciation of that word. You already know the pronunciation;
 invent a suitable text form.
+
+Prefer plain lowercase letter sequences a careful English reader would say
+aloud correctly. Avoid dictionary respell conventions that literal TTS
+engines misread: ALL-CAPS stress marks, AH/UH/OO vowel codes, IPA-ish
+digraphs, and fancy hyphenation that changes which letters the engine sees.
+Write as if feeding a child-oriented English TTS that sounds out spelling,
+not a linguist's respelling key.
 
 Reply with ONLY a JSON object: {"speakForm":"..."}.
 No other keys, no markdown, no explanation.
@@ -210,14 +218,15 @@ def _claude_respell(
     locale: str = "en-US",
     engine: str | None = None,
     prior_pack_form: str | None = None,
-) -> str | None:
+) -> tuple[str | None, str]:
+    """Returns (speakForm or None, raw Claude text)."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        return None
+        return None, ""
     try:
         import anthropic
     except ImportError:
-        return None
+        return None, ""
 
     fed = (spoken_form or spelling).strip() or spelling
     prior = (prior_pack_form or "").strip()
@@ -256,13 +265,13 @@ def _claude_respell(
     ).strip()
     cand = _parse_speak_form(text)
     if not cand:
-        return None
+        return None, text
     # Reject exact / folded echo of a known failure.
     cf = _fold_speak(cand)
     for ban in banned:
         if cf == _fold_speak(ban):
-            return None
-    return cand
+            return None, text
+    return cand, text
 
 
 @app.get("/health")
@@ -337,17 +346,26 @@ def post_report(body: ReportIn) -> dict:
     record = body.model_dump()
     record["normalized"] = key
     record["receivedAt"] = datetime.now(timezone.utc).isoformat()
-    (REPORTS_DIR / f"{report_id}.json").write_text(
-        json.dumps(record, indent=2) + "\n"
-    )
+    record["priorSpeakForm"] = existing
 
-    suggestion = _claude_respell(
+    suggestion, claude_raw = _claude_respell(
         spelling,
         body.spokenForm,
         locale=body.locale or "en-US",
         engine=body.engine,
         prior_pack_form=existing,
     )
+    record["claudeRaw"] = claude_raw
+    record["claudeSpeakForm"] = suggestion
+    (REPORTS_DIR / f"{report_id}.json").write_text(
+        json.dumps(record, indent=2) + "\n"
+    )
+    print(
+        f"WG-PRON report spelling={spelling!r} spokenForm={body.spokenForm!r} "
+        f"prior={existing!r} claudeSpeakForm={suggestion!r} raw={claude_raw!r}",
+        flush=True,
+    )
+
     if not suggestion:
         # Drop a prior the learner already rejected rather than keeping it.
         dropped = False
@@ -372,6 +390,9 @@ def post_report(body: ReportIn) -> dict:
     exact = pack.setdefault("exact", {})
     retrained = bool(existing) and existing != suggestion
     exact[key] = suggestion
+    # Apply immediately for Hear, but do not treat as final — learners may
+    # re-report. Pack still lists the spelling so OTA devices pick it up;
+    # client keeps the report button visible for the retrain loop.
     vetted = pack.setdefault("vetted", [])
     if key not in {_norm(str(v)) for v in vetted}:
         vetted.append(key)

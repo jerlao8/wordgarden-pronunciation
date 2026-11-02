@@ -258,7 +258,11 @@ def _lookup(pack: dict, spelling: str) -> str | None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "packVersion": _load_pack().get("packVersion")}
+    return {
+        "ok": True,
+        "version": app.version,
+        "packVersion": _load_pack().get("packVersion"),
+    }
 
 
 @app.get("/v1/speak-rewrites")

@@ -10,8 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PACK = ROOT / "store" / "remote" / "speak_rewrites_ota.json"
-# Same gist as bundled_banks.json — add speak_rewrites_ota.json as a second file.
-GIST_ID = "9383f04223241543400b0a2e43199ffd"
+# Dedicated public gist for the speak-rewrites OTA pack.
+GIST_ID = "c5fdb854b75d7ab4a82cddfcc83a3b64"
 
 
 def main() -> None:

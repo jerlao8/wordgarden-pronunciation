@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: wordgarden-pronunciation
+    runtime: docker
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: WG_SPEAK_PACK_GIST
+        value: c5fdb854b75d7ab4a82cddfcc83a3b64
+      - key: WG_PRON_DATA
+        value: /var/data
+    disk:
+      name: pron-data
+      mountPath: /var/data
+      sizeGB: 1

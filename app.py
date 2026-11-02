@@ -23,7 +23,7 @@ REPORTS_DIR = DATA_ROOT / "reports"
 SEED_PACK = HERE / "speak_rewrites_ota.json"
 if not SEED_PACK.exists():
     SEED_PACK = HERE.parents[1] / "store" / "remote" / "speak_rewrites_ota.json"
-GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "9383f04223241543400b0a2e43199ffd")
+GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64")
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 

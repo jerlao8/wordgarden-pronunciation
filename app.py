@@ -27,7 +27,7 @@ GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.2.0")
+app = FastAPI(title="WordGarden pronunciation", version="0.2.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -137,7 +137,55 @@ def _publish_gist(pack: dict) -> None:
         return
 
 
-def _claude_respell(spelling: str, spoken_form: str) -> str | None:
+def _drop_spelling(pack: dict, spelling: str) -> bool:
+    """Remove [spelling] from exact + vetted. Returns True if anything changed."""
+    key = _norm(spelling)
+    if not key:
+        return False
+    exact = pack.setdefault("exact", {})
+    vetted = pack.setdefault("vetted", [])
+    changed = False
+    if key in exact:
+        exact.pop(key, None)
+        changed = True
+    new_vetted = [v for v in vetted if _norm(str(v)) != key]
+    if len(new_vetted) != len(vetted):
+        pack["vetted"] = new_vetted
+        changed = True
+    return changed
+
+
+def _purge_operator_revoked() -> None:
+    """Drop spellings operators unmarked (e.g. bad Claude rewrite). Idempotent."""
+    # Keep this list short — only entries explicitly revoked, not a denylist.
+    revoked = ("lasagna",)
+    pack = _load_pack()
+    changed = False
+    for spelling in revoked:
+        if _drop_spelling(pack, spelling):
+            changed = True
+    if not changed:
+        return
+    pack["packVersion"] = _bump_pack_version(str(pack.get("packVersion") or "0"))
+    pack["hyphenPolicy"] = "ota_corrections"
+    _save_pack(pack)
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _purge_operator_revoked()
+
+
+def _claude_respell(
+    spelling: str,
+    spoken_form: str,
+    *,
+    locale: str = "en-US",
+    engine: str | None = None,
+    voice_id: str | None = None,
+    prior_pack_form: str | None = None,
+    has_audio: bool = False,
+) -> str | None:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
@@ -147,14 +195,30 @@ def _claude_respell(spelling: str, spoken_form: str) -> str | None:
         return None
 
     client = anthropic.Anthropic(api_key=key)
+    # Anthropic Messages API has no audio modality — WAV is stored for operators.
+    # Claude still gets the full textual context the app sent with the clip.
+    prior_line = (
+        f"Prior pack correction (may be wrong): {prior_pack_form}\n"
+        if prior_pack_form
+        else ""
+    )
+    audio_line = (
+        "TTS WAV was uploaded with this report (stored server-side; not playable here).\n"
+        if has_audio
+        else "No WAV attached.\n"
+    )
     prompt = f"""You write Phonon-TTS speak forms for a children's spelling app.
 Phonon is English text-only (no IPA). Return ONE short American-English
 respelling or lightly hyphenated form that a neural TTS will say correctly.
 Do not explain. No quotes. Prefer ordinary English letters.
+If a prior pack correction is listed, it sounded wrong — propose a different form.
 
-Spelling: {spelling}
-Current speak form: {spoken_form or spelling}
-"""
+Spelling (orthography): {spelling}
+Current speak form fed to TTS: {spoken_form or spelling}
+{prior_line}Locale: {locale}
+Engine: {engine or "unknown"}
+Voice: {voice_id or "default"}
+{audio_line}"""
     msg = client.messages.create(
         model=os.environ.get("WG_CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
         max_tokens=40,
@@ -201,6 +265,30 @@ def get_correction(spelling: str) -> dict:
     }
 
 
+@app.delete("/v1/corrections/{spelling}")
+def delete_correction(spelling: str) -> dict:
+    """Un-vet a spelling so devices can show Doesn’t sound right again."""
+    key = _norm(spelling)
+    if not key:
+        raise HTTPException(status_code=400, detail="empty spelling")
+    pack = _load_pack()
+    if not _drop_spelling(pack, key):
+        return {
+            "status": "absent",
+            "spelling": spelling,
+            "packVersion": pack.get("packVersion"),
+        }
+    pack["packVersion"] = _bump_pack_version(str(pack.get("packVersion") or "0"))
+    pack["hyphenPolicy"] = "ota_corrections"
+    _save_pack(pack)
+    return {
+        "status": "removed",
+        "spelling": spelling,
+        "vetted": False,
+        "packVersion": pack["packVersion"],
+    }
+
+
 @app.post("/v1/pronunciation-reports")
 def post_report(body: ReportIn) -> dict:
     spelling = body.spelling.strip()
@@ -234,7 +322,15 @@ def post_report(body: ReportIn) -> dict:
             "detail": "Correction exists; applied immediately on device.",
         }
 
-    suggestion = _claude_respell(spelling, body.spokenForm)
+    suggestion = _claude_respell(
+        spelling,
+        body.spokenForm,
+        locale=body.locale or "en-US",
+        engine=body.engine,
+        voice_id=body.voiceId,
+        prior_pack_form=existing,
+        has_audio=bool(body.wavBase64),
+    )
     if not suggestion:
         return {
             "status": "queued",

@@ -1,7 +1,8 @@
 {
   "version": 1,
-  "packVersion": "2026-11-02.0",
+  "packVersion": "2026-11-02.2",
   "hyphenPolicy": "ota_corrections",
   "exact": {},
-  "regex": []
+  "regex": [],
+  "vetted": []
 }

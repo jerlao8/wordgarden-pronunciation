@@ -24,6 +24,12 @@ if not SEED_PACK.exists():
     SEED_PACK = HERE.parents[1] / "store" / "remote" / "speak_rewrites_ota.json"
 GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64")
 
+# Lasagna-only Phonon override. Claude's `luh-ZAN-yuh` / `luh zahn yuh`
+# normalize to forms Phonon voices as "loozanyo". `lazanya` forces nya.
+_OPERATOR_EXACT: dict[str, str] = {
+    "lasagna": "lazanya",
+}
+
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="WordGarden pronunciation", version="0.3.1")
@@ -62,10 +68,59 @@ def _fold_speak(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").casefold())
 
 
+_PAUSE_MARKS = re.compile(r"[-‐‑‒–—_]")
+
+
+def _normalize_speak_form_for_phonon(form: str, *, spelling: str | None = None) -> str:
+    """Strip Phonon pause marks from a speak form (mirrors Dart helper).
+
+    Hyphens / underscores → removed. Spaces removed when [spelling] is a
+    single token (Claude `con frairs` → `confrairs`); multi-word spellings
+    keep word spaces (`or derves`). Apostrophes kept. Lowercased.
+    """
+    s = (
+        (form or "")
+        .strip()
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("ʼ", "'")
+        .casefold()
+    )
+    if not s:
+        return s
+    s = _PAUSE_MARKS.sub("", s)
+    spelling_stripped = (spelling or "").strip()
+    single_token = bool(spelling_stripped) and not re.search(r"\s", spelling_stripped)
+    if single_token:
+        s = re.sub(r"\s+", "", s)
+    else:
+        s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _apply_operator_exact(pack: dict) -> bool:
+    """Force lasagna-only (etc.) speak forms; returns True if pack changed."""
+    exact = pack.setdefault("exact", {})
+    vetted = pack.setdefault("vetted", [])
+    changed = False
+    vetted_keys = {_norm(str(v)) for v in vetted}
+    for raw, spoken in _OPERATOR_EXACT.items():
+        key = _norm(raw)
+        form = _normalize_speak_form_for_phonon(spoken, spelling=raw) or spoken
+        if exact.get(key) != form:
+            exact[key] = form
+            changed = True
+        if key not in vetted_keys:
+            vetted.append(key)
+            vetted_keys.add(key)
+            changed = True
+    return changed
+
+
 def _load_pack() -> dict:
     path = PACK_PATH if PACK_PATH.exists() else SEED_PACK
     if not path.exists():
-        return {
+        pack = {
             "version": 1,
             "packVersion": "0",
             "hyphenPolicy": "ota_corrections",
@@ -73,10 +128,22 @@ def _load_pack() -> dict:
             "regex": [],
             "vetted": [],
         }
-    pack = json.loads(path.read_text())
-    pack.setdefault("exact", {})
-    pack.setdefault("regex", [])
-    pack.setdefault("vetted", list(pack.get("exact", {}).keys()))
+    else:
+        pack = json.loads(path.read_text())
+        pack.setdefault("exact", {})
+        pack.setdefault("regex", [])
+        pack.setdefault("vetted", list(pack.get("exact", {}).keys()))
+    if _apply_operator_exact(pack):
+        # Persist so OTA/corrections GET see the operator form immediately.
+        # Only runs when the on-disk form differed (no bump loop).
+        pack["packVersion"] = _bump_pack_version(
+            str(pack.get("packVersion") or "0")
+        )
+        pack["hyphenPolicy"] = "ota_corrections"
+        try:
+            _save_pack(pack)
+        except OSError:
+            pass
     return pack
 
 
@@ -155,7 +222,11 @@ def _drop_spelling(pack: dict, spelling: str) -> bool:
 def _lookup(pack: dict, spelling: str) -> str | None:
     key = _norm(spelling)
     exact = pack.get("exact") or {}
-    return exact.get(key) or exact.get(spelling)
+    raw = exact.get(key) or exact.get(spelling)
+    if not raw:
+        return None
+    # Older pack rows may still carry hyphen pause marks.
+    return _normalize_speak_form_for_phonon(str(raw), spelling=spelling) or None
 
 
 # Minimal, general — no word lists, loanword tables, or digraph cookbooks.
@@ -168,10 +239,10 @@ return one short American-English respelling that Phonon will voice as the
 correct US pronunciation of that word. You already know the pronunciation;
 invent a suitable text form.
 
-Prefer plain lowercase letter sequences a careful English reader would say
-aloud correctly. Avoid dictionary respell conventions that literal TTS
-engines misread: ALL-CAPS stress marks, AH/UH/OO vowel codes, IPA-ish
-digraphs, and fancy hyphenation that changes which letters the engine sees.
+Prefer one continuous lowercase letter string a careful English reader would
+say aloud correctly — no hyphens or syllable spaces (the client also strips
+those). Avoid dictionary respell conventions that literal TTS engines
+misread: ALL-CAPS stress marks, AH/UH/OO vowel codes, and IPA-ish digraphs.
 Write as if feeding a child-oriented English TTS that sounds out spelling,
 not a linguist's respelling key.
 
@@ -266,12 +337,13 @@ def _claude_respell(
     cand = _parse_speak_form(text)
     if not cand:
         return None, text
-    # Reject exact / folded echo of a known failure.
+    # Reject exact / folded echo of a known failure (pre-smooth).
     cf = _fold_speak(cand)
     for ban in banned:
         if cf == _fold_speak(ban):
             return None, text
-    return cand, text
+    smoothed = _normalize_speak_form_for_phonon(cand, spelling=spelling)
+    return (smoothed or None), text
 
 
 @app.get("/health")
@@ -348,6 +420,46 @@ def post_report(body: ReportIn) -> dict:
     record["receivedAt"] = datetime.now(timezone.utc).isoformat()
     record["priorSpeakForm"] = existing
 
+    # Operator-locked spellings (lasagna): keep the Phonon-vetted form;
+    # never let Claude overwrite with a worse respell.
+    if key in _OPERATOR_EXACT:
+        locked = _normalize_speak_form_for_phonon(
+            _OPERATOR_EXACT[key], spelling=spelling
+        )
+        record["claudeRaw"] = ""
+        record["claudeSpeakForm"] = locked
+        record["operatorLocked"] = True
+        (REPORTS_DIR / f"{report_id}.json").write_text(
+            json.dumps(record, indent=2) + "\n"
+        )
+        exact = pack.setdefault("exact", {})
+        vetted = pack.setdefault("vetted", [])
+        changed = exact.get(key) != locked
+        exact[key] = locked
+        if key not in {_norm(str(v)) for v in vetted}:
+            vetted.append(key)
+            changed = True
+        if changed:
+            pack["packVersion"] = _bump_pack_version(
+                str(pack.get("packVersion") or "0")
+            )
+            pack["hyphenPolicy"] = "ota_corrections"
+            _save_pack(pack)
+        print(
+            f"WG-PRON report spelling={spelling!r} operatorLocked={locked!r} "
+            f"prior={existing!r}",
+            flush=True,
+        )
+        return {
+            "status": "locked",
+            "spelling": spelling,
+            "speakForm": locked,
+            "vetted": True,
+            "packVersion": pack.get("packVersion"),
+            "priorSpeakForm": existing,
+            "detail": "Operator-locked speak form; Claude skipped.",
+        }
+
     suggestion, claude_raw = _claude_respell(
         spelling,
         body.spokenForm,
@@ -389,6 +501,7 @@ def post_report(body: ReportIn) -> dict:
 
     exact = pack.setdefault("exact", {})
     retrained = bool(existing) and existing != suggestion
+    # suggestion is already Phonon-smoothed in _claude_respell.
     exact[key] = suggestion
     # Apply immediately for Hear, but do not treat as final — learners may
     # re-report. Pack still lists the spelling so OTA devices pick it up;

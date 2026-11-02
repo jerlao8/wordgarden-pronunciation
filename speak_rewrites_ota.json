@@ -1,8 +1,12 @@
 {
   "version": 1,
-  "packVersion": "2026-11-02.9",
+  "packVersion": "2026-11-02.11",
   "hyphenPolicy": "ota_corrections",
-  "exact": {},
+  "exact": {
+    "lasagna": "lazanya"
+  },
   "regex": [],
-  "vetted": []
+  "vetted": [
+    "lasagna"
+  ]
 }

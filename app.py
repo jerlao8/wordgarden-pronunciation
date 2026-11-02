@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -27,7 +26,7 @@ GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.2.3")
+app = FastAPI(title="WordGarden pronunciation", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,12 +46,6 @@ class ReportIn(BaseModel):
     engine: str | None = None
     clipCacheGen: str | None = None
     appVersion: str | None = None
-    wavBase64: str | None = None
-    wavFileName: str | None = None
-    # Optional learner/operator label for what the clip sounded like
-    # (e.g. "loozanyo"). Claude cannot hear the WAV; this is the failure signal.
-    heardLike: str | None = None
-    failureNote: str | None = None
 
 
 def _norm(s: str) -> str:
@@ -66,19 +59,7 @@ def _norm(s: str) -> str:
 
 
 def _fold_speak(s: str) -> str:
-    """Collapse hyphens/spaces/caps so near-variants compare equal."""
     return re.sub(r"[^a-z0-9]+", "", (s or "").casefold())
-
-
-def _soft_fold(s: str) -> str:
-    """Folds Phonon-equivalent vowel spellings without turning 'lah' into 'la'.
-
-    Maps zahn→zan, oo→u, uh→u. Does NOT map ah→a (that made lah-ZAHN-ya
-    collide with lazanya and blocked the better lasagna candidates).
-    """
-    x = _fold_speak(s)
-    x = x.replace("zahn", "zan").replace("oo", "u").replace("uh", "u")
-    return x
 
 
 def _load_pack() -> dict:
@@ -113,7 +94,6 @@ def _bump_pack_version(current: str) -> str:
 def _save_pack(pack: dict) -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     PACK_PATH.write_text(json.dumps(pack, indent=2, ensure_ascii=False) + "\n")
-    # Keep repo copy in sync when running locally.
     try:
         if SEED_PACK.parent.exists():
             SEED_PACK.write_text(PACK_PATH.read_text())
@@ -123,7 +103,6 @@ def _save_pack(pack: dict) -> None:
 
 
 def _publish_gist(pack: dict) -> None:
-    """Push pack to the public gist devices fetch (best-effort)."""
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if not token or not GIST_ID:
         return
@@ -153,12 +132,10 @@ def _publish_gist(pack: dict) -> None:
         with urllib.request.urlopen(req, timeout=20) as resp:
             resp.read()
     except Exception:
-        # Local disk pack still serves GET /v1/speak-rewrites and corrections.
         return
 
 
 def _drop_spelling(pack: dict, spelling: str) -> bool:
-    """Remove [spelling] from exact + vetted. Returns True if anything changed."""
     key = _norm(spelling)
     if not key:
         return False
@@ -175,147 +152,55 @@ def _drop_spelling(pack: dict, spelling: str) -> bool:
     return changed
 
 
-def _collect_failed_forms(spelling: str, *extras: str | None) -> list[str]:
-    """Prior speak forms that already failed for this spelling (reports + extras)."""
+def _lookup(pack: dict, spelling: str) -> str | None:
     key = _norm(spelling)
-    out: list[str] = []
-    seen: set[str] = set()
+    exact = pack.get("exact") or {}
+    return exact.get(key) or exact.get(spelling)
 
-    def add(form: str | None) -> None:
-        f = (form or "").strip()
-        if not f:
-            return
-        fold = _fold_speak(f)
-        if not fold or fold in seen:
-            return
-        seen.add(fold)
-        out.append(f)
 
-    for extra in extras:
-        add(extra)
+# Minimal, general — no word lists, loanword tables, or digraph cookbooks.
+_SYSTEM_PROMPT = """You write speak forms for Phonon, an English neural TTS that
+reads ordinary text literally (no IPA, no SSML).
 
-    if REPORTS_DIR.exists():
-        for path in sorted(REPORTS_DIR.glob("*.json")):
+Given a spelling and (optionally) a speak form that already sounded wrong,
+return one short American-English respelling that Phonon will voice as the
+correct US pronunciation of that word. You already know the pronunciation;
+invent a suitable text form.
+
+Reply with ONLY a JSON object: {"speakForm":"..."}.
+No other keys, no markdown, no explanation.
+Constraints: speakForm uses letters, spaces, hyphens, apostrophes only;
+length 1–80; do not echo a known-failed spokenForm."""
+
+
+def _parse_speak_form(text: str) -> str | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Prefer JSON object; fall back to a bare string line.
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            cand = str(obj.get("speakForm") or "").strip()
+        elif isinstance(obj, str):
+            cand = obj.strip()
+        else:
+            cand = ""
+    except json.JSONDecodeError:
+        # Model sometimes wraps JSON in fences or adds a line of prose.
+        m = re.search(r"\{[^{}]*\"speakForm\"[^{}]*\}", raw, re.S)
+        if m:
             try:
-                rec = json.loads(path.read_text())
+                cand = str(json.loads(m.group(0)).get("speakForm") or "").strip()
             except Exception:
-                continue
-            if _norm(str(rec.get("normalized") or rec.get("spelling") or "")) != key:
-                continue
-            add(str(rec.get("spokenForm") or ""))
-            add(str(rec.get("appliedSpeakForm") or ""))
-            add(str(rec.get("heardLike") or ""))
-    return out
-
-
-# Phonon misreads dictionary respells of Italian -gn- words as "loo…yo".
-# Reject these shapes server-side even when Claude echoes the old prompt example.
-_LOOZANYO_SHAPE = re.compile(
-    r"(?i)^\s*(loo|luh|lu)[- ]?(zan|zahn)[- ]?(yo|yuh|ya)\s*$"
-    r"|loozanyo|loo[- ]?zan[- ]?yo|lazanya"
-)
-
-
-def _looks_loozanyo_like(form: str) -> bool:
-    f = (form or "").strip()
-    if not f:
-        return False
-    if _LOOZANYO_SHAPE.search(f):
-        return True
-    fold = _fold_speak(f)
-    soft = _soft_fold(f)
-    # Exact known-bad collapses (including old prompt example luh-ZAHN-yuh).
-    return fold in {
-        "loozanyo",
-        "loozahnyo",
-        "luhzanyuh",
-        "luhzahnyuh",
-        "luhzanya",
-        "luhzahnya",
-        "lazanya",
-    } or soft in {"loozanyo", "luzanyo", "luzanyu", "luzanya", "lazanya"}
-
-
-def _too_close_to_failed(candidate: str, failed: list[str]) -> bool:
-    c = _fold_speak(candidate)
-    cs = _soft_fold(candidate)
-    if not c:
-        return False
-    for ban in failed:
-        b = _fold_speak(ban)
-        bs = _soft_fold(ban)
-        if not b:
-            continue
-        if c == b or cs == bs:
-            return True
-        # Tiny edits of a known failure (hyphen/caps already folded).
-        if abs(len(c) - len(b)) <= 1 and _edit_distance(c, b) <= 1:
-            return True
-    return False
-
-
-def _edit_distance(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            ins = cur[j - 1] + 1
-            delete = prev[j] + 1
-            sub = prev[j - 1] + (ca != cb)
-            cur.append(min(ins, delete, sub))
-        prev = cur
-    return prev[-1]
-
-
-def _reject_reason(candidate: str, failed: list[str]) -> str | None:
-    if _looks_loozanyo_like(candidate):
-        return "loozanyo_shape"
-    if _too_close_to_failed(candidate, failed):
-        return "echo_failed_form"
-    return None
-
-
-_SYSTEM_PROMPT = """You write Phonon-TTS speak forms for WordGarden, a US children's
-spelling app. Phonon (Zoey 31M) is English text-only neural TTS — no IPA, no
-SSML phonemes. Your job is ONE short American-English respelling the model
-will say correctly when read as ordinary English text.
-
-IMPORTANT: You cannot hear audio. Train only from spelling + the speak form
-that was fed to Phonon + any learner "heard like" / prior-failure labels.
-
-Output rules:
-- Return ONLY the speak form. No quotes, no explanation, no IPA.
-- Prefer ordinary English letters; light hyphenation between syllables is OK.
-- Optional CAPS on the stressed syllable (dictionary-respell style) is OK.
-- Avoid letter-name traps (forms that make the model say letter names).
-- If the form fed to TTS already failed, propose a DIFFERENT form — never
-  echo the failed spokenForm, a prior pack correction, or a near-variant
-  (same letters with only hyphen/CAPS/AH↔A/UH↔U changes).
-
-Phonon failure modes (observed — do NOT propose these shapes):
-- Italian -gn- food words: dictionary respells like "luh-ZAHN-yuh",
-  "luh-ZAN-yuh", "la-zan-ya", "loo-ZAHN-yo" are heard as "loozanyo".
-  Avoid "loo"/"luh"/"lu" onsets paired with "zan"/"zahn" and "yo"/"yuh"
-  endings. Prefer an open "lah"/"la" first syllable and a clear final "ya",
-  or leave ordinary English orthography when a respell keeps failing.
-- Avoid Spanish-ish / Italian orthography endings English TTS mangles
-  (-o / -anyo onsets with "loo-").
-
-Other loanword patterns (patterns only; not per-word hardcodes):
-- bruschetta → roughly "broo-SKET-uh" (US hard-k; not British "SHET")
-- croissant → roughly "kwah-SAHN"
-- hors d'oeuvres → roughly "or-DURVZ"
-- chauffeur → roughly "shoh-FUR"
-
-When unsure between raw orthography and a respell, pick the form most likely
-to yield the US dictionary reading on Phonon English TTS — and never reuse a
-form the learner already marked wrong."""
+                cand = raw.strip("\"'` ").splitlines()[0].strip()
+        else:
+            cand = raw.strip("\"'` ").splitlines()[0].strip()
+    if not cand or len(cand) > 80:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9'’\- ]+", cand):
+        return None
+    return cand
 
 
 def _claude_respell(
@@ -324,13 +209,7 @@ def _claude_respell(
     *,
     locale: str = "en-US",
     engine: str | None = None,
-    voice_id: str | None = None,
     prior_pack_form: str | None = None,
-    failed_forms: list[str] | None = None,
-    heard_like: str | None = None,
-    failure_note: str | None = None,
-    has_audio: bool = False,
-    reject_hint: str | None = None,
 ) -> str | None:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
@@ -340,120 +219,50 @@ def _claude_respell(
     except ImportError:
         return None
 
-    client = anthropic.Anthropic(api_key=key)
-    # Anthropic Messages API has no audio modality — WAV is stored for operators.
-    # Claude must infer the failure from spelling + spokenForm (+ labels/history).
     fed = (spoken_form or spelling).strip() or spelling
     prior = (prior_pack_form or "").strip()
-    failed = [f for f in (failed_forms or []) if (f or "").strip()]
+    banned = []
+    for form in (fed, prior):
+        fold = _fold_speak(form)
+        if fold and fold not in {_fold_speak(b) for b in banned}:
+            banned.append(form)
+
     failed_line = ""
-    if failed:
-        joined = ", ".join(failed[:12])
+    if banned:
         failed_line = (
-            f"Previous speak forms that ALREADY failed for this spelling "
-            f"(do not reuse or near-variants): {joined}\n"
+            "Failed spokenForm(s) — do not reuse or near-variants: "
+            + ", ".join(banned)
+            + "\n"
         )
-    heard = (heard_like or "").strip()
-    heard_line = (
-        f'Learner said the clip sounded like: "{heard}" — avoid any form '
-        f"Phonon would voice that way.\n"
-        if heard
-        else ""
-    )
-    note = (failure_note or "").strip()
-    note_line = f"Failure note: {note}\n" if note else ""
-    prior_line = (
-        f"Prior pack correction that STILL sounded wrong (do not reuse): {prior}\n"
-        if prior
-        else ""
-    )
-    if has_audio:
-        audio_line = (
-            "A Phonon TTS WAV was uploaded with this report and stored for "
-            "operators. You CANNOT hear it — the Messages API has no audio "
-            "input. Infer what went wrong from the orthography vs the speak "
-            "form that was fed to TTS, plus any heard-like / prior-failure "
-            "labels.\n"
-        )
-    else:
-        audio_line = "No WAV attached; rely on spelling + spokenForm + labels.\n"
 
-    reject_line = (
-        f"Your previous proposal was rejected ({reject_hint}). "
-        f"Propose a clearly different form.\n"
-        if reject_hint
-        else ""
+    user = (
+        f"spelling: {spelling}\n"
+        f"spokenForm (failed): {fed}\n"
+        f"{failed_line}"
+        f"locale: {locale}\n"
+        f"engine: {engine or 'phonon'}\n"
+        'Return JSON: {"speakForm":"..."}\n'
     )
 
-    user = f"""Spelling (orthography the child is learning): {spelling}
-Speak form that was fed to Phonon and sounded wrong: {fed}
-{prior_line}{failed_line}{heard_line}{note_line}{reject_line}Locale: {locale}
-Engine: {engine or "phonon"}
-Voice: {voice_id or "Zoey"}
-{audio_line}
-Return one improved speak form for Phonon."""
-
+    client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
         model=os.environ.get("WG_CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
-        max_tokens=40,
+        max_tokens=60,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user}],
     )
     text = "".join(
         b.text for b in msg.content if getattr(b, "type", None) == "text"
     ).strip()
-    text = text.strip("\"'` ").splitlines()[0].strip()
-    if not text or len(text) > 80:
+    cand = _parse_speak_form(text)
+    if not cand:
         return None
-    if not re.fullmatch(r"[A-Za-z0-9'’\- ]+", text):
-        return None
-    reason = _reject_reason(text, failed + [fed, prior, heard])
-    if reason:
-        return None
-    return text
-
-
-def _claude_respell_with_retry(**kwargs: object) -> str | None:
-    """Ask Claude; if the proposal is banned, retry once with a reject hint."""
-    first = _claude_respell(**kwargs)  # type: ignore[arg-type]
-    if first:
-        return first
-    # Second attempt only when we have an API key path that returned None due
-    # to rejection — still call again with an explicit reject hint so Claude
-    # leaves the loozanyo basin.
-    failed = list(kwargs.get("failed_forms") or [])  # type: ignore[arg-type]
-    fed = str(kwargs.get("spoken_form") or "")
-    prior = str(kwargs.get("prior_pack_form") or "")
-    hint = "near-variant of a failed form or loozanyo-shaped respell"
-    kwargs = dict(kwargs)
-    kwargs["reject_hint"] = hint
-    # Seed failed list with common loozanyo basin so retry avoids it.
-    basin = [
-        fed,
-        prior,
-        "luh-ZAHN-yuh",
-        "luh-ZAN-yuh",
-        "la-zan-ya",
-        "loo-ZAHN-yo",
-        "loozanyo",
-        "lazanya",
-    ]
-    merged: list[str] = []
-    seen: set[str] = set()
-    for f in list(failed) + basin:
-        fold = _fold_speak(str(f))
-        if not fold or fold in seen:
-            continue
-        seen.add(fold)
-        merged.append(str(f))
-    kwargs["failed_forms"] = merged
-    return _claude_respell(**kwargs)  # type: ignore[arg-type]
-
-
-def _lookup(pack: dict, spelling: str) -> str | None:
-    key = _norm(spelling)
-    exact = pack.get("exact") or {}
-    return exact.get(key) or exact.get(spelling)
+    # Reject exact / folded echo of a known failure.
+    cf = _fold_speak(cand)
+    for ban in banned:
+        if cf == _fold_speak(ban):
+            return None
+    return cand
 
 
 @app.get("/health")
@@ -486,7 +295,7 @@ def get_correction(spelling: str) -> dict:
 
 @app.delete("/v1/corrections/{spelling}")
 def delete_correction(spelling: str) -> dict:
-    """Un-vet a spelling so devices can show Doesn’t sound right again."""
+    """Un-vet a spelling so devices can show Doesn't sound right again."""
     key = _norm(spelling)
     if not key:
         raise HTTPException(status_code=400, detail="empty spelling")
@@ -512,13 +321,8 @@ def delete_correction(spelling: str) -> dict:
 def post_report(body: ReportIn) -> dict:
     """Accept a report and (re)train a speak form via Claude.
 
-    Always retrain on a new report. A prior pack entry is treated as a failed
-    attempt when the learner heard it and tapped Doesn't sound right again —
-    never short-circuit with already_corrected.
-
-    Claude does not receive audio (Anthropic Messages API has no audio
-    modality). Training uses spelling + spokenForm + optional heardLike /
-    failure history. WAV is stored for operators only.
+    Claude is prompted with spelling + failed spokenForm only (no audio).
+    Always retrain on a new report; never short-circuit with already_corrected.
     """
     spelling = body.spelling.strip()
     if not spelling:
@@ -528,69 +332,24 @@ def post_report(body: ReportIn) -> dict:
     pack = _load_pack()
     existing = _lookup(pack, spelling)
 
-    # Infer a heard-like label when the failed feed itself is loozanyo-shaped.
-    heard_like = (body.heardLike or "").strip() or None
-    if not heard_like and (
-        _looks_loozanyo_like(body.spokenForm) or _looks_loozanyo_like(existing or "")
-    ):
-        heard_like = "loozanyo"
-
-    basin: list[str] = []
-    # Only inject the known Phonon basin when this report is already in it
-    # (or the learner labeled "loozanyo") — do not ban those strings globally.
-    if heard_like and _soft_fold(heard_like) in {
-        "loozanyo",
-        "luzanyo",
-        "luzanyu",
-    }:
-        basin = [
-            "luh-ZAHN-yuh",  # old system-prompt example Phonon misreads
-            "luh-ZAN-yuh",
-            "la-zan-ya",
-            "loo-ZAHN-yo",
-            "loozanyo",
-            "lazanya",
-        ]
-
-    failed = _collect_failed_forms(
-        spelling,
-        body.spokenForm,
-        existing,
-        heard_like,
-        *basin,
-    )
-
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_id = body.id or f"{stamp}-{key}"
     record = body.model_dump()
     record["normalized"] = key
     record["receivedAt"] = datetime.now(timezone.utc).isoformat()
-    if heard_like and not body.heardLike:
-        record["heardLikeInferred"] = heard_like
     (REPORTS_DIR / f"{report_id}.json").write_text(
-        json.dumps({k: v for k, v in record.items() if k != "wavBase64"}, indent=2)
-        + "\n"
+        json.dumps(record, indent=2) + "\n"
     )
-    if body.wavBase64:
-        wav_name = body.wavFileName or f"{report_id}.wav"
-        (REPORTS_DIR / wav_name).write_bytes(base64.b64decode(body.wavBase64))
 
-    suggestion = _claude_respell_with_retry(
-        spelling=spelling,
-        spoken_form=body.spokenForm,
+    suggestion = _claude_respell(
+        spelling,
+        body.spokenForm,
         locale=body.locale or "en-US",
         engine=body.engine,
-        voice_id=body.voiceId,
         prior_pack_form=existing,
-        failed_forms=failed,
-        heard_like=heard_like,
-        failure_note=body.failureNote,
-        has_audio=bool(body.wavBase64),
     )
     if not suggestion:
-        # Do NOT keep a prior form the learner already rejected — that is the
-        # loozanyo loop. Drop it so devices fall back to raw orthography and
-        # the report button returns.
+        # Drop a prior the learner already rejected rather than keeping it.
         dropped = False
         if existing and _drop_spelling(pack, key):
             pack["packVersion"] = _bump_pack_version(
@@ -607,31 +366,7 @@ def post_report(body: ReportIn) -> dict:
             "packVersion": pack.get("packVersion"),
             "priorSpeakForm": existing,
             "droppedPrior": dropped,
-            "detail": (
-                "Stored for review; Claude returned no usable form "
-                "(rejected echo/loozanyo-shape or no API key). "
-                "Prior pack entry cleared."
-                if dropped
-                else "Stored for review; Claude returned no usable form."
-            ),
-        }
-
-    # Final gate — never write a loozanyo-shaped form into the pack.
-    if _reject_reason(suggestion, failed):
-        if existing and _drop_spelling(pack, key):
-            pack["packVersion"] = _bump_pack_version(
-                str(pack.get("packVersion") or "0")
-            )
-            pack["hyphenPolicy"] = "ota_corrections"
-            _save_pack(pack)
-        return {
-            "status": "queued",
-            "spelling": spelling,
-            "speakForm": None,
-            "vetted": False,
-            "packVersion": pack.get("packVersion"),
-            "priorSpeakForm": existing,
-            "detail": "Rejected loozanyo-shaped / failed-form echo; prior cleared.",
+            "detail": "Stored for review; Claude returned no usable form.",
         }
 
     exact = pack.setdefault("exact", {})

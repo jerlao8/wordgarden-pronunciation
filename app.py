@@ -27,7 +27,7 @@ GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.2.1")
+app = FastAPI(title="WordGarden pronunciation", version="0.2.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -155,27 +155,6 @@ def _drop_spelling(pack: dict, spelling: str) -> bool:
     return changed
 
 
-def _purge_operator_revoked() -> None:
-    """Drop spellings operators unmarked (e.g. bad Claude rewrite). Idempotent."""
-    # Keep this list short — only entries explicitly revoked, not a denylist.
-    revoked = ("lasagna",)
-    pack = _load_pack()
-    changed = False
-    for spelling in revoked:
-        if _drop_spelling(pack, spelling):
-            changed = True
-    if not changed:
-        return
-    pack["packVersion"] = _bump_pack_version(str(pack.get("packVersion") or "0"))
-    pack["hyphenPolicy"] = "ota_corrections"
-    _save_pack(pack)
-
-
-@app.on_event("startup")
-def _on_startup() -> None:
-    _purge_operator_revoked()
-
-
 def _claude_respell(
     spelling: str,
     spoken_form: str,
@@ -196,33 +175,64 @@ def _claude_respell(
 
     client = anthropic.Anthropic(api_key=key)
     # Anthropic Messages API has no audio modality — WAV is stored for operators.
-    # Claude still gets the full textual context the app sent with the clip.
+    # Claude must infer the failure from spelling + spokenForm (+ prior form).
+    fed = (spoken_form or spelling).strip() or spelling
+    prior = (prior_pack_form or "").strip()
     prior_line = (
-        f"Prior pack correction (may be wrong): {prior_pack_form}\n"
-        if prior_pack_form
+        f"Prior pack correction that STILL sounded wrong (do not reuse): {prior}\n"
+        if prior
         else ""
     )
-    audio_line = (
-        "TTS WAV was uploaded with this report (stored server-side; not playable here).\n"
-        if has_audio
-        else "No WAV attached.\n"
-    )
-    prompt = f"""You write Phonon-TTS speak forms for a children's spelling app.
-Phonon is English text-only (no IPA). Return ONE short American-English
-respelling or lightly hyphenated form that a neural TTS will say correctly.
-Do not explain. No quotes. Prefer ordinary English letters.
-If a prior pack correction is listed, it sounded wrong — propose a different form.
+    if has_audio:
+        audio_line = (
+            "A Phonon TTS WAV was uploaded with this report and stored for "
+            "operators. You CANNOT hear it — the Messages API has no audio "
+            "input. Infer what went wrong from the orthography vs the speak "
+            "form that was fed to TTS (and any prior failed correction).\n"
+        )
+    else:
+        audio_line = "No WAV attached; rely on spelling + spokenForm only.\n"
 
-Spelling (orthography): {spelling}
-Current speak form fed to TTS: {spoken_form or spelling}
+    system = """You write Phonon-TTS speak forms for WordGarden, a US children's
+spelling app. Phonon (Zoey 31M) is English text-only neural TTS — no IPA, no
+SSML phonemes. Your job is ONE short American-English respelling the model
+will say correctly when read as ordinary English text.
+
+Output rules:
+- Return ONLY the speak form. No quotes, no explanation, no IPA.
+- Prefer ordinary English letters; light hyphenation between syllables is OK.
+- Optional CAPS on the stressed syllable (dictionary-respell style) is OK.
+- Avoid letter-name traps (forms that make the model say letter names).
+- Avoid Spanish-ish or Italian-orthography endings that English TTS mangles
+  (e.g. -o / -anyo / "loo-" onsets on Italian food words).
+- Match General American dictionary pronunciation for the headword.
+- If the form fed to TTS already failed, propose a DIFFERENT form — never
+  echo the failed spokenForm or a prior pack correction.
+
+Loanword guidance (examples of target US sound — patterns only; do not
+hardcode unless the reported spelling matches that word):
+- lasagna → roughly "luh-ZAHN-yuh" / la-zan-ya (NOT "loo-zan-yo" / loozanyo)
+- bruschetta → roughly "broo-SKET-uh" (NOT "broo-SHET-uh" British drift if US)
+- croissant → roughly "kwah-SAHN"
+- hors d'oeuvres → roughly "or-DURVZ"
+- chauffeur → roughly "shoh-FUR"
+
+When unsure between raw orthography and a respell, pick the form most likely
+to yield the US dictionary reading on Phonon English TTS."""
+
+    user = f"""Spelling (orthography the child is learning): {spelling}
+Speak form that was fed to Phonon and sounded wrong: {fed}
 {prior_line}Locale: {locale}
-Engine: {engine or "unknown"}
-Voice: {voice_id or "default"}
-{audio_line}"""
+Engine: {engine or "phonon"}
+Voice: {voice_id or "Zoey"}
+{audio_line}
+Return one improved speak form for Phonon."""
+
     msg = client.messages.create(
         model=os.environ.get("WG_CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
         max_tokens=40,
-        messages=[{"role": "user", "content": prompt}],
+        system=system,
+        messages=[{"role": "user", "content": user}],
     )
     text = "".join(
         b.text for b in msg.content if getattr(b, "type", None) == "text"
@@ -231,6 +241,11 @@ Voice: {voice_id or "default"}
     if not text or len(text) > 80:
         return None
     if not re.fullmatch(r"[A-Za-z0-9'’\- ]+", text):
+        return None
+    # Reject echo of the failed form — force a real retrain attempt.
+    if text.casefold() == fed.casefold():
+        return None
+    if prior and text.casefold() == prior.casefold():
         return None
     return text
 
@@ -291,6 +306,12 @@ def delete_correction(spelling: str) -> dict:
 
 @app.post("/v1/pronunciation-reports")
 def post_report(body: ReportIn) -> dict:
+    """Accept a report and (re)train a speak form via Claude.
+
+    Always retrain on a new report. A prior pack entry is treated as a failed
+    attempt when the learner heard it and tapped Doesn't sound right again —
+    never short-circuit with already_corrected.
+    """
     spelling = body.spelling.strip()
     if not spelling:
         raise HTTPException(status_code=400, detail="empty spelling")
@@ -312,16 +333,6 @@ def post_report(body: ReportIn) -> dict:
         wav_name = body.wavFileName or f"{report_id}.wav"
         (REPORTS_DIR / wav_name).write_bytes(base64.b64decode(body.wavBase64))
 
-    if existing:
-        return {
-            "status": "already_corrected",
-            "spelling": spelling,
-            "speakForm": existing,
-            "vetted": True,
-            "packVersion": pack.get("packVersion"),
-            "detail": "Correction exists; applied immediately on device.",
-        }
-
     suggestion = _claude_respell(
         spelling,
         body.spokenForm,
@@ -332,25 +343,31 @@ def post_report(body: ReportIn) -> dict:
         has_audio=bool(body.wavBase64),
     )
     if not suggestion:
+        # Keep any prior form so the device is not left with nothing; mark
+        # queued so operators can fix manually.
         return {
             "status": "queued",
             "spelling": spelling,
-            "vetted": False,
-            "detail": "Stored for review; set ANTHROPIC_API_KEY to auto-correct.",
+            "speakForm": existing,
+            "vetted": bool(existing),
+            "packVersion": pack.get("packVersion"),
+            "detail": "Stored for review; Claude returned no usable form.",
         }
 
     exact = pack.setdefault("exact", {})
+    retrained = bool(existing) and existing != suggestion
     exact[key] = suggestion
     vetted = pack.setdefault("vetted", [])
-    if key not in vetted:
+    if key not in {_norm(str(v)) for v in vetted}:
         vetted.append(key)
     pack["packVersion"] = _bump_pack_version(str(pack.get("packVersion") or "0"))
     pack["hyphenPolicy"] = "ota_corrections"
     _save_pack(pack)
     return {
-        "status": "corrected",
+        "status": "retrained" if retrained else "corrected",
         "spelling": spelling,
         "speakForm": suggestion,
         "vetted": True,
         "packVersion": pack["packVersion"],
+        "priorSpeakForm": existing,
     }

@@ -33,7 +33,7 @@ _OPERATOR_EXACT: dict[str, str] = {
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.4.0")
+app = FastAPI(title="WordGarden pronunciation", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -462,10 +462,10 @@ def post_report(body: ReportIn) -> dict:
     """Accept a report; publish OTA only after multiple distinct reporters.
 
     Claude is prompted with spelling + failed spokenForm only (no audio).
-    First report(s) are stored (Claude logged) with status `recorded` and are
-    NOT pushed to the OTA pack — Phonon is usually better than a one-tap
-    Claude rewrite. Once [REPORT_PUBLISH_THRESHOLD] distinct reporters agree,
-    Claude's speakForm is published + vetted for everyone.
+    First report(s) return Claude's speakForm with status `recorded` so the
+    reporting device can apply it locally; the OTA pack is NOT updated until
+    [REPORT_PUBLISH_THRESHOLD] distinct reporters agree (`published` /
+    `retrained` + vetted for everyone).
     """
     spelling = body.spelling.strip()
     if not spelling:
@@ -549,20 +549,21 @@ def post_report(body: ReportIn) -> dict:
         flush=True,
     )
 
-    # Below threshold: store + log Claude, do not OTA-publish or auto-apply.
+    # Below threshold: return Claude speakForm for local apply on this device;
+    # do not OTA-publish or mark vetted-for-everyone yet.
     if tally["distinct"] < REPORT_PUBLISH_THRESHOLD:
         return {
             "status": "recorded",
             "spelling": spelling,
-            "speakForm": None,
+            "speakForm": suggestion,
             "vetted": False,
             "packVersion": pack.get("packVersion"),
             "priorSpeakForm": existing,
             "reportCount": tally["distinct"],
             "threshold": REPORT_PUBLISH_THRESHOLD,
             "detail": (
-                "Stored; waiting for more reports before OTA publish. "
-                "Claude suggestion logged server-side only."
+                "Claude speakForm for local apply; waiting for more reports "
+                "before OTA publish."
             ),
         }
 

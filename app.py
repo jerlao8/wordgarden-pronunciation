@@ -33,7 +33,7 @@ _OPERATOR_EXACT: dict[str, str] = {
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.5.0")
+app = FastAPI(title="WordGarden pronunciation", version="0.5.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,7 +43,7 @@ app.add_middleware(
 
 # Distinct reporters (or raw report count without reporterId) before OTA.
 REPORT_PUBLISH_THRESHOLD = max(
-    1, int(os.environ.get("WG_PRON_REPORT_THRESHOLD", "2"))
+    1, int(os.environ.get("WG_PRON_REPORT_THRESHOLD", "10"))
 )
 TALLY_PATH = DATA_ROOT / "report_tally.json"
 
@@ -170,9 +170,13 @@ def _bump_pack_version(current: str) -> str:
 def _save_pack(pack: dict) -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     PACK_PATH.write_text(json.dumps(pack, indent=2, ensure_ascii=False) + "\n")
+    # Mirror into the repo seed only when DATA_ROOT is the live volume
+    # (not ephemeral unit-test dirs, which would pollute speak_rewrites_ota.json).
     try:
-        if SEED_PACK.parent.exists():
-            SEED_PACK.write_text(PACK_PATH.read_text())
+        if SEED_PACK.parent.exists() and PACK_PATH.resolve() != SEED_PACK.resolve():
+            data_root = DATA_ROOT.resolve()
+            if data_root == Path("/var/data") or os.environ.get("WG_PRON_MIRROR_SEED") == "1":
+                SEED_PACK.write_text(PACK_PATH.read_text())
     except OSError:
         pass
     _publish_gist(pack)

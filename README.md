@@ -16,16 +16,19 @@ per-word phonology rules in the system prompt. Reports log `claudeRaw` +
 ## Multi-report threshold
 
 OTA publish to the gist / mark `exact`+`vetted` for **everyone** waits until
-**≥2 distinct reporters** agree (env `WG_PRON_REPORT_THRESHOLD`, default `2`).
+**≥10 distinct reporters** agree (env `WG_PRON_REPORT_THRESHOLD`, default `10`).
 The **reporting device** still gets Claude’s `speakForm` on the first report
-for local apply (`status: "recorded"`, `vetted: false`).
+for local apply (`status: "recorded"`, `vetted: false`). Permanent hide of
+Doesn’t sound right on **all** installs happens only after that publish —
+devices adopt the pack (`exact` + `vetted`) via OTA / `ensureForSpelling`.
 
 1. App POSTs JSON to `POST /v1/pronunciation-reports` with `spelling`,
    `spokenForm`, and a stable anonymous `reporterId` (install id).
 2. First report(s): Claude speakForm → `status: "recorded"` with `speakForm`
    (client applies locally; pack unchanged).
 3. When the threshold is met: pack update + gist publish →
-   `status: "published"` (or `retrained`) with `speakForm` + `vetted: true`.
+   `status: "published"` (or `retrained`) with `speakForm` + `vetted: true`
+   so every device hides the report button after fetch.
 4. Operator-locked spellings (lasagna) still publish immediately (`locked`).
 
 Without `reporterId`, each report id counts toward the threshold (MVP

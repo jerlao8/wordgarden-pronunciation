@@ -13,13 +13,32 @@ proposes a short text respell optimized for grapheme-to-phoneme-naive TTS
 per-word phonology rules in the system prompt. Reports log `claudeRaw` +
 `spokenForm` under `/var/data/reports/` and stdout (`WG-PRON report …`).
 
+## Multi-report threshold
+
+Phonon is usually better than a one-tap Claude rewrite. The API **does not**
+publish to the OTA gist / mark `exact`+`vetted` until **≥2 distinct
+reporters** agree (env `WG_PRON_REPORT_THRESHOLD`, default `2`).
+
+1. App POSTs JSON to `POST /v1/pronunciation-reports` with `spelling`,
+   `spokenForm`, and a stable anonymous `reporterId` (install id).
+2. First report(s): store + optionally log Claude → response
+   `status: "recorded"` (no `speakForm`; client keeps Phonon).
+3. When the threshold is met: Claude speakForm → pack update + gist publish
+   → `status: "published"` (or `retrained`) with `speakForm` + `vetted: true`.
+4. Operator-locked spellings (lasagna) still publish immediately (`locked`).
+
+Without `reporterId`, each report id counts toward the threshold (MVP
+limitation: the same device can inflate the count).
+
 ## Flow
 
-1. App POSTs JSON to `POST /v1/pronunciation-reports` (spelling, spokenForm).
-2. Claude returns `{"speakForm":"..."}`.
-3. Pack `exact[spelling]` is updated, `packVersion` bumped, gist published.
-4. Re-reports always retrain. If Claude returns nothing usable, any prior
-   pack entry for that spelling is dropped.
+1. App POSTs JSON to `POST /v1/pronunciation-reports` (spelling, spokenForm,
+   reporterId).
+2. Below threshold → `recorded` (Claude logged server-side only).
+3. At threshold → Claude `{"speakForm":"..."}` → pack `exact` + `vetted`,
+   `packVersion` bumped, gist published.
+4. If Claude returns nothing usable at threshold, any prior pack entry for
+   that spelling is dropped (`queued`).
 
 ## Run locally
 

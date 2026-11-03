@@ -25,20 +25,27 @@ if not SEED_PACK.exists():
 GIST_ID = os.environ.get("WG_SPEAK_PACK_GIST", "c5fdb854b75d7ab4a82cddfcc83a3b64")
 
 # Lasagna-only Phonon override. Claude's `luh-ZAN-yuh` / `luh zahn yuh`
-# normalize to forms Phonon voices as "loozanyo". `lazanya` forces nya.
+# normalize to forms Phonon voices as "loozanyo". `lazanya` forces nya but
+# stresses LA-; `luhzahnya` keeps nya with mid ZA stress (la-ZA-nya).
 _OPERATOR_EXACT: dict[str, str] = {
-    "lasagna": "lazanya",
+    "lasagna": "luhzahnya",
 }
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="WordGarden pronunciation", version="0.3.1")
+app = FastAPI(title="WordGarden pronunciation", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Distinct reporters (or raw report count without reporterId) before OTA.
+REPORT_PUBLISH_THRESHOLD = max(
+    1, int(os.environ.get("WG_PRON_REPORT_THRESHOLD", "2"))
+)
+TALLY_PATH = DATA_ROOT / "report_tally.json"
 
 
 class ReportIn(BaseModel):
@@ -52,6 +59,8 @@ class ReportIn(BaseModel):
     engine: str | None = None
     clipCacheGen: str | None = None
     appVersion: str | None = None
+    # Stable anonymous install id from the client (preferred for threshold).
+    reporterId: str | None = None
 
 
 def _norm(s: str) -> str:
@@ -229,6 +238,55 @@ def _lookup(pack: dict, spelling: str) -> str | None:
     return _normalize_speak_form_for_phonon(str(raw), spelling=spelling) or None
 
 
+def _load_tally() -> dict:
+    if not TALLY_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(TALLY_PATH.read_text())
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_tally(tally: dict) -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    TALLY_PATH.write_text(json.dumps(tally, indent=2, ensure_ascii=False) + "\n")
+
+
+def _note_report(
+    key: str,
+    *,
+    reporter_id: str | None,
+    report_id: str,
+) -> dict:
+    """Track distinct reporters per spelling for the publish threshold.
+
+    Prefer [reporter_id]. Without it, each report_id counts (MVP limitation:
+    the same device can inflate the count by reinstalling / clearing local id).
+    """
+    tally = _load_tally()
+    entry = tally.setdefault(key, {"reporters": [], "reportIds": []})
+    reporters: list[str] = list(entry.get("reporters") or [])
+    report_ids: list[str] = list(entry.get("reportIds") or [])
+    newly = False
+    rid = (reporter_id or "").strip()
+    token = rid if rid else (report_id or "").strip()
+    if token and token not in reporters:
+        reporters.append(token)
+        newly = True
+    if report_id and report_id not in report_ids:
+        report_ids.append(report_id)
+    entry["reporters"] = reporters
+    entry["reportIds"] = report_ids
+    tally[key] = entry
+    _save_tally(tally)
+    return {
+        "distinct": len(reporters),
+        "total": len(report_ids),
+        "newlyCounted": newly,
+    }
+
+
 # Minimal, general — no word lists, loanword tables, or digraph cookbooks.
 _SYSTEM_PROMPT = """You write speak forms for Phonon, an English neural TTS that
 reads ordinary Latin text literally (grapheme-to-phoneme naive; no IPA, no
@@ -352,6 +410,7 @@ def health() -> dict:
         "ok": True,
         "version": app.version,
         "packVersion": _load_pack().get("packVersion"),
+        "reportPublishThreshold": REPORT_PUBLISH_THRESHOLD,
     }
 
 
@@ -400,10 +459,13 @@ def delete_correction(spelling: str) -> dict:
 
 @app.post("/v1/pronunciation-reports")
 def post_report(body: ReportIn) -> dict:
-    """Accept a report and (re)train a speak form via Claude.
+    """Accept a report; publish OTA only after multiple distinct reporters.
 
     Claude is prompted with spelling + failed spokenForm only (no audio).
-    Always retrain on a new report; never short-circuit with already_corrected.
+    First report(s) are stored (Claude logged) with status `recorded` and are
+    NOT pushed to the OTA pack — Phonon is usually better than a one-tap
+    Claude rewrite. Once [REPORT_PUBLISH_THRESHOLD] distinct reporters agree,
+    Claude's speakForm is published + vetted for everyone.
     """
     spelling = body.spelling.strip()
     if not spelling:
@@ -420,8 +482,15 @@ def post_report(body: ReportIn) -> dict:
     record["receivedAt"] = datetime.now(timezone.utc).isoformat()
     record["priorSpeakForm"] = existing
 
+    tally = _note_report(
+        key,
+        reporter_id=body.reporterId,
+        report_id=report_id,
+    )
+    record["reportTally"] = tally
+
     # Operator-locked spellings (lasagna): keep the Phonon-vetted form;
-    # never let Claude overwrite with a worse respell.
+    # never let Claude overwrite with a worse respell. Publish immediately.
     if key in _OPERATOR_EXACT:
         locked = _normalize_speak_form_for_phonon(
             _OPERATOR_EXACT[key], spelling=spelling
@@ -447,7 +516,7 @@ def post_report(body: ReportIn) -> dict:
             _save_pack(pack)
         print(
             f"WG-PRON report spelling={spelling!r} operatorLocked={locked!r} "
-            f"prior={existing!r}",
+            f"prior={existing!r} tally={tally}",
             flush=True,
         )
         return {
@@ -457,6 +526,7 @@ def post_report(body: ReportIn) -> dict:
             "vetted": True,
             "packVersion": pack.get("packVersion"),
             "priorSpeakForm": existing,
+            "reportCount": tally["distinct"],
             "detail": "Operator-locked speak form; Claude skipped.",
         }
 
@@ -474,12 +544,31 @@ def post_report(body: ReportIn) -> dict:
     )
     print(
         f"WG-PRON report spelling={spelling!r} spokenForm={body.spokenForm!r} "
-        f"prior={existing!r} claudeSpeakForm={suggestion!r} raw={claude_raw!r}",
+        f"prior={existing!r} claudeSpeakForm={suggestion!r} "
+        f"tally={tally} raw={claude_raw!r}",
         flush=True,
     )
 
+    # Below threshold: store + log Claude, do not OTA-publish or auto-apply.
+    if tally["distinct"] < REPORT_PUBLISH_THRESHOLD:
+        return {
+            "status": "recorded",
+            "spelling": spelling,
+            "speakForm": None,
+            "vetted": False,
+            "packVersion": pack.get("packVersion"),
+            "priorSpeakForm": existing,
+            "reportCount": tally["distinct"],
+            "threshold": REPORT_PUBLISH_THRESHOLD,
+            "detail": (
+                "Stored; waiting for more reports before OTA publish. "
+                "Claude suggestion logged server-side only."
+            ),
+        }
+
     if not suggestion:
-        # Drop a prior the learner already rejected rather than keeping it.
+        # Threshold met but Claude failed — drop a prior the learner already
+        # rejected rather than keeping a bad pack entry.
         dropped = False
         if existing and _drop_spelling(pack, key):
             pack["packVersion"] = _bump_pack_version(
@@ -496,6 +585,7 @@ def post_report(body: ReportIn) -> dict:
             "packVersion": pack.get("packVersion"),
             "priorSpeakForm": existing,
             "droppedPrior": dropped,
+            "reportCount": tally["distinct"],
             "detail": "Stored for review; Claude returned no usable form.",
         }
 
@@ -503,9 +593,6 @@ def post_report(body: ReportIn) -> dict:
     retrained = bool(existing) and existing != suggestion
     # suggestion is already Phonon-smoothed in _claude_respell.
     exact[key] = suggestion
-    # Apply immediately for Hear, but do not treat as final — learners may
-    # re-report. Pack still lists the spelling so OTA devices pick it up;
-    # client keeps the report button visible for the retrain loop.
     vetted = pack.setdefault("vetted", [])
     if key not in {_norm(str(v)) for v in vetted}:
         vetted.append(key)
@@ -513,10 +600,13 @@ def post_report(body: ReportIn) -> dict:
     pack["hyphenPolicy"] = "ota_corrections"
     _save_pack(pack)
     return {
-        "status": "retrained" if retrained else "corrected",
+        "status": "retrained" if retrained else "published",
+        # Alias kept for older clients that check `corrected`.
+        "corrected": True,
         "spelling": spelling,
         "speakForm": suggestion,
         "vetted": True,
         "packVersion": pack["packVersion"],
         "priorSpeakForm": existing,
+        "reportCount": tally["distinct"],
     }

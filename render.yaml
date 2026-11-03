@@ -14,6 +14,8 @@ services:
         value: c5fdb854b75d7ab4a82cddfcc83a3b64
       - key: WG_PRON_DATA
         value: /var/data
+      - key: WG_PRON_REPORT_THRESHOLD
+        value: "10"
     disk:
       name: pron-data
       mountPath: /var/data
